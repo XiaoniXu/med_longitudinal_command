@@ -1,0 +1,370 @@
+---
+title: "Read_Med_Longitudinal"
+author: "Xiaoni Xu"
+date: "2025-09-16"
+output: html_document
+---
+
+```{r}
+library(SimDesign)
+library(timereg)
+library(tidyr)
+library(dplyr)
+library(mice)
+library(splitstackshape)
+library(foreach)
+library(data.table)
+library(survival)
+library(mvtnorm)
+library(parallel)
+library(doParallel)
+```
+
+```{r}
+load("simData.mimick.SHS.RDa")
+
+
+set.seed(2)  
+# subset the data into 10000 instead of 2000. 2025/8/26
+simData <- simData[sample(1:nrow(simData), size = 10000, replace = FALSE), ]
+
+simData[, M_1 := M1]
+simData[, M_2 := M2]
+
+# Counting-process helpers the outcome model needs
+simData[, `:=`(tstart = 0, tstop = time_to_event,
+               time.since.first.exam_1 = 0,
+               time.since.first.exam_2 = time_to_event)]
+
+# Unique ID for tmerge / reshape
+simData[, id_unique := .I]
+
+simData <- as.data.frame(simData)
+```
+
+
+
+
+```{r}
+boot <- matrix(NA, nrow = 1000, ncol = 4)
+
+for (i in 1:1000) {
+  ind  <- sample(seq_len(nrow(simData)), replace = TRUE)
+  data <- simData[ind, , drop = FALSE]
+
+  # ---- IDs expected by med_longitudinal ----
+  data$id_unique <- seq_len(nrow(data))
+  data$idno      <- if ("id" %in% names(data)) data$id else data$id_unique   ### CHANGED
+
+  # ---- Make sure the columns that Y/med_longitudinal will look for exist ----
+  # Y uses const(M) by label -> create a baseline M column (mapped to M_1 here)
+  if (!("M" %in% names(data))) data$M <- data$M_1                            ### CHANGED
+
+  # ---- mediator & dropout models (fit on the resample) ----
+  M1 <- lm(M_1 ~ E + C, data = data)
+  L1 <- glm(D1 ~ E + M_1 + C, data = data, family = binomial())
+  M2 <- lm(M_2 ~ E + M_1 + C, data = data)
+  L2 <- glm(D2 ~ E + M_2 + C, data = data, family = binomial())
+
+  # ---- counting-process data for the outcome model ----
+  df <- survival::tmerge(
+    data1 = data,
+    data2 = data,
+    id    = id_unique,
+    endpt = event(time_to_event, eventHappened)
+  )
+
+  # reshape time-varying mediator into long to inject via tdc()
+  df_tv <- reshape(
+    as.data.frame(data),
+    direction = "long",
+    varying   = list(
+      M    = c("M_1", "M_2"),
+      time = c("time.since.first.exam_1", "time.since.first.exam_2")
+    ),
+    v.names = c("M", "time.since.first.exam"),
+    times   = c(1, 2),
+    idvar   = "id_unique"
+  )
+  df_tv <- df_tv[order(df_tv$id_unique, df_tv$time), ]
+
+  df <- survival::tmerge(
+    data1 = df,
+    data2 = df_tv,
+    id    = id_unique,
+    M     = tdc(time.since.first.exam, M)
+  )
+
+  # ---- outcome model ----
+  Y <- timereg::aalen(
+    Surv(tstart, tstop, endpt) ~ const(E) + const(M) + const(C),
+    data = df,
+    resample.iid = 1,
+    n.sim = 0
+  )
+
+  # ---- assemble arguments for med_longitudinal ----
+  treat <- "E"
+  L     <- list(L1 = L1, L2 = L2)
+  Mlist <- list(M1 = M1, M2 = M2)
+
+  # IMPORTANT: time_points should be the bare time labels the function pastes onto
+  #            "time.since.first.exam_" internally (i.e., "1","2", not the full col names)
+  mvec  <- c("M_1", "M_2")
+  tpts  <- c("1", "2")                                                     ### CHANGED
+
+  a      <- as.numeric(quantile(data$E, 0.25, na.rm = TRUE))
+  a_star <- as.numeric(quantile(data$E, 0.75, na.rm = TRUE))
+
+  # ---- call the function; pass the *wide* baseline data ----
+  out <- med_longitudinal(
+    L = L, M = Mlist, m = mvec, Y = Y, treat = treat,
+    control.value = a, treat.value = a_star,
+    data = data,                     ### keep 'data' (not 'df'); the function subsets from here
+    time_points = tpts,              ### now "1","2" -> matches columns via paste0 inside
+    peryr = 100000
+  )
+
+  boot[i, ] <- as.numeric(out)
+}
+```
+
+see the results
+```{r}
+## 1) Make sure columns are named
+if (is.null(colnames(boot)) || any(colnames(boot) == "")) {
+  colnames(boot) <- c("DE","IEM","IED","TE")
+}
+
+## 2) Basic sanity checks
+colSums(!is.finite(boot))     # count NA/Inf per column
+summary(as.data.frame(boot))  # quick five-number summaries
+head(boot, 5)
+
+## 3) Percentile estimates and 95% CIs (2.5%, 50%, 97.5%)
+qfun <- function(x) {
+  qs <- quantile(x, c(.025,.5,.975), na.rm = TRUE)
+  c(LCL = qs[1], Median = qs[2], UCL = qs[3], SD = sd(x, na.rm=TRUE))
+}
+
+summ <- t(apply(boot, 2, qfun))
+round(summ, 3)
+
+```
+
+
+Original `med_longitudinal` function ("CM_CR_gFormula_hazard.R")
+
+```{r}
+med_longitudinal=function(L=NULL, M, m, Y, treat='logcocr', control.value=a, treat.value=a_star, data, time_points, peryr=100000){
+  
+  N=dim(data)[1]
+  NL=length(L)
+  NM=length(M)
+  
+  boot <- foreach(i=1:10000, .combine='rbind') %dopar% {
+    ind <- sample(1:N, replace=TRUE)
+   
+    MModel = list()
+    for (i in 1:NM){
+      MModel[[i]] <- rmvnorm(1, mean = coef(M[[i]]), sigma = vcov(M[[i]]))
+    }
+    
+    YModel = rmvnorm(1, mean = Y$gamma, sigma = Y$robvar.gamma)
+    
+    PredictL_a <- PredictL_astar <- PredictL_astar_a <- matrix(NA,nrow=N,ncol=NL)
+    PredictM_a <- PredictM_astar <- PredictM_a_astar <- matrix(NA,nrow=N,ncol=NM)
+    
+    # Predict M1
+    pred.data.astar.m1 <- pred.data.a.m1 <- model.frame(M[[1]])[ind,]
+    pred.data.astar.m1[, treat] <- treat.value
+    pred.data.a.m1[, treat] <- control.value
+    
+    m1mat.astar <- model.matrix(terms(M[[1]]), data = pred.data.astar.m1)
+    m1mat.a <- model.matrix(terms(M[[1]]), data = pred.data.a.m1)
+    
+    PredictM_astar[,1] <- tcrossprod(MModel[[1]], m1mat.astar)
+    PredictM_a[,1] <- tcrossprod(MModel[[1]], m1mat.a)
+    
+    # Predict L1
+    if(NL > 0){
+      pred.data.astar.l1 <- pred.data.a.l1 <- pred.data.astar.a.l1 <- model.frame(L[[1]])[ind,]
+      pred.data.astar.l1[, treat] <- pred.data.astar.a.l1[, treat] <- treat.value
+      pred.data.a.l1[, treat] <- control.value
+      pred.data.astar.l1[, m[1]] <- PredictM_astar[,1]
+      pred.data.a.l1[, m[1]] <- pred.data.astar.a.l1[, m[1]] <- PredictM_a[,1]
+      
+      PredictL_astar_a[,1] <- rbinom(N, size=1, prob=predict(L[[1]], pred.data.astar.a.l1, type='response'))
+      PredictL_a[,1] <- rbinom(N, size=1, prob=predict(L[[1]], pred.data.a.l1, type='response'))
+      PredictL_astar[,1] <- rbinom(N, size=1, prob=predict(L[[1]], pred.data.astar.l1, type='response'))
+    }
+    
+    # Predict Li (only if more than one time point)
+    if (NM > 1){
+      for (i in 2:NM){
+        pred.data.a.m <- pred.data.astar.m <- pred.data.a.astar.m <- as.data.frame(matrix(nrow=N, ncol=(dim(model.frame(M[[i]]))[2]-1)))
+        colnames(pred.data.a.m) <- colnames(pred.data.astar.m) <- colnames(pred.data.a.astar.m) <- attr(terms(M[[i]]),"term.labels")
+        names <- colnames(pred.data.a.m)[which(colnames(pred.data.a.m) %in% attr(terms(M[[1]]),"term.labels"))]
+        
+        pred.data.a.m[, names] <- pred.data.a.astar.m[, names] <- pred.data.astar.m[, names] <- model.frame(M[[1]])[ind,names]
+        pred.data.a.m[, treat] <- pred.data.a.astar.m[, treat] <- control.value
+        pred.data.astar.m[, treat] <- treat.value
+        
+        pred.data.a.m[, m[i-1]] <- PredictM_a[,i-1]
+        pred.data.astar.m[, m[i-1]] <- PredictM_astar[,i-1]
+        pred.data.a.astar.m[, m[i-1]] <- PredictM_a_astar[,i-1]
+        if(i==2){
+          pred.data.a.astar.m[, m[1]] <- PredictM_a[,1]
+        }
+        
+        if(NL > 1){
+          m1mat.a.m <- model.matrix(~.,data=pred.data.a.m[which(PredictL_a[,i-1]==0),])
+          m1mat.astar.m <- model.matrix(~., data = pred.data.astar.m[which(PredictL_astar[,i-1]==0),])
+          m1mat.a.astar.m <- model.matrix(~., data = pred.data.a.astar.m[which(PredictL_astar_a[,i-1]==0),])
+          
+          PredictM_a[which(PredictL_a[,i-1]==0),i] <- tcrossprod(MModel[[i]], m1mat.a.m)
+          PredictM_astar[which(PredictL_astar[,i-1]==0),i] <- tcrossprod(MModel[[i]], m1mat.astar.m)
+          PredictM_a_astar[which(PredictL_astar_a[,i-1]==0),i] <- tcrossprod(MModel[[i]], m1mat.a.astar.m)
+        } else{
+          m1mat.a.m <- model.matrix(~.,data=pred.data.a.m)
+          m1mat.astar.m <- model.matrix(~., data = pred.data.astar.m)
+          m1mat.a.astar.m <- model.matrix(~., data = pred.data.a.astar.m)
+          
+          PredictM_a[,i] <- tcrossprod(MModel[[i]], m1mat.a.m)
+          PredictM_astar[,i] <- tcrossprod(MModel[[i]], m1mat.astar.m)
+          PredictM_a_astar[,i] <- tcrossprod(MModel[[i]], m1mat.a.astar.m)
+        }
+        
+        if(NL > 1 & i<=NL){
+          pred.data.a.l <- pred.data.astar.l <- pred.data.astar.a.l <- as.data.frame(matrix(nrow=N, ncol=(dim(model.frame(L[[i]]))[2]-1)))
+          colnames(pred.data.a.l) <- colnames(pred.data.astar.l) <- colnames(pred.data.astar.a.l) <- attr(terms(L[[i]]),"term.labels")
+          names <- colnames(pred.data.a.l)[which(colnames(pred.data.a.l) %in% attr(terms(L[[1]]),"term.labels"))]
+          
+          pred.data.a.l[, names] <- pred.data.astar.a.l[, names] <- pred.data.astar.l[, names] <- model.frame(L[[1]])[ind,names]
+          pred.data.a.l[, treat] <- control.value
+          pred.data.astar.l[, treat] <- pred.data.astar.a.l[, treat] <- treat.value
+          
+          pred.data.a.l[, m[i]] <- PredictM_a[,i]
+          pred.data.astar.l[, m[i]] <- PredictM_astar[,i]
+          pred.data.astar.a.l[, m[i]] <- PredictM_a_astar[,i]
+          
+          PredictL_a[which(PredictL_a[,i-1]==0),i] <- rbinom(length(which(PredictL_a[,i-1]==0)), size=1, prob=predict(L[[i]], pred.data.a.l[which(PredictL_a[,i-1]==0),], type='response'))
+          PredictL_astar[which(PredictL_astar[,i-1]==0),i] <- rbinom(length(which(PredictL_astar[,i-1]==0)), size=1, prob=predict(L[[i]], pred.data.astar.l[which(PredictL_astar[,i-1]==0),], type='response'))
+          PredictL_astar_a[which(PredictL_astar_a[,i-1]==0),i] <- rbinom(length(which(PredictL_astar_a[,i-1]==0)), size=1, prob=predict(L[[i]], pred.data.astar.a.l[which(PredictL_astar_a[,i-1]==0),], type='response'))
+        }
+      }
+    }
+    
+    
+    # Predict Y
+    # Data augmentation method for person-time database
+    # PredictY_DEIEM: a*, D1_a, M1_aD1a, D2_aD1aM1aD1a, M2_aD1aM1aD2a
+    # PredictY_TEDE_2: a, D1_a, M1_aD1a, D2_aD1a M1aD1a, M2_aD1aM1aD2a
+    # PredictY_IEMIED: a*, D1_a, M1_a*D1a, D2_aD1a M1a*D1a, M2_a*D1aM1a*D2a
+    # PredictY_IEDTE_1: a*, D1_a*, M1_a*D1a*, D2_a*D1a*M1a*D1a*, M2_a*D1a*M1a*D2a*
+    
+    pred.data.a.y <- pred.data.astar.y <- pred.data.astar.a.y <- pred.data.astar.a.astar.a.y <- data[ind,c('idno',getvarnames(Y$call)$xvar[-2],m,colnames(data)[grep('time.since.first.exam', colnames(data))])]
+    pred.data.a.y[, treat] <- control.value
+    pred.data.astar.y[, treat] <- pred.data.astar.a.y[, treat] <- pred.data.astar.a.astar.a.y[, treat] <- treat.value
+    pred.data.a.y[, m] <- pred.data.astar.a.y[, m] <- PredictM_a
+    pred.data.astar.y[, m] <- PredictM_astar
+    pred.data.astar.a.astar.a.y[, m] <- PredictM_a_astar
+    pred.data.astar.a.astar.a.y[, m[1]] <- PredictM_a[,1]
+    
+
+
+    
+    
+    ########################
+    # prepare counterfactual datasets for predicting outcomes from the model
+    # where mediators and time-varying covariates change across time
+
+    # Build varying lists correctly: one entry per time-varying variable
+    M_cols  <- m
+    TS_cols <- paste0("time.since.first.exam_", time_points)
+    stopifnot(length(M_cols) == length(TS_cols))
+
+    reshape_to_long <- function(df_wide){
+      df_wide$id_boot <- seq_len(nrow(df_wide))
+      df_long <- reshape(
+        df_wide,
+        direction = "long",
+        varying   = list(M_cols, TS_cols),
+        v.names   = c("M","time_since"),
+        times     = time_points,
+        timevar   = "tidx",
+        idvar     = "id_boot"
+      )
+      df_long[order(df_long$id_boot, df_long$tidx), , drop = FALSE]
+    }
+
+    # pred.data.a.y
+    df_tv <- reshape_to_long(pred.data.a.y)
+    df_pred.data.a.y <- df_tv[, match(getvarnames(Y$call)$xvar, colnames(df_tv)), drop = FALSE]
+    df_pred.data.a.y <- model.matrix(~., data = df_pred.data.a.y)[, -1, drop = FALSE]
+
+    # pred.data.astar.y
+    df_tv <- reshape_to_long(pred.data.astar.y)
+    df_pred.data.astar.y <- df_tv[, match(getvarnames(Y$call)$xvar, colnames(df_tv)), drop = FALSE]
+    df_pred.data.astar.y <- model.matrix(~., data = df_pred.data.astar.y)[, -1, drop = FALSE]
+
+    # pred.data.astar.a.astar.a.y
+    df_tv <- reshape_to_long(pred.data.astar.a.astar.a.y)
+    df_pred.data.astar.a.astar.a.y <- df_tv[, match(getvarnames(Y$call)$xvar, colnames(df_tv)), drop = FALSE]
+    df_pred.data.astar.a.astar.a.y <- model.matrix(~., data = df_pred.data.astar.a.astar.a.y)[, -1, drop = FALSE]
+
+    # pred.data.astar.a.y
+    df_tv <- reshape_to_long(pred.data.astar.a.y)
+    df_pred.data.astar.a.y <- df_tv[, match(getvarnames(Y$call)$xvar, colnames(df_tv)), drop = FALSE]
+    df_pred.data.astar.a.y <- model.matrix(~., data = df_pred.data.astar.a.y)[, -1, drop = FALSE]
+
+    
+# predict counterfactual outcomes
+    # each line computes a predicted hazard under a specific counterfactual scenario
+    PredictY_DEIEM <- mean(tcrossprod(YModel, df_pred.data.astar.a.y))
+    PredictY_TEDE_2 <- mean(tcrossprod(YModel, df_pred.data.a.y))
+    PredictY_IEMIED <- mean(tcrossprod(YModel, df_pred.data.astar.a.astar.a.y))
+    PredictY_IEDTE_1 <- mean(tcrossprod(YModel, df_pred.data.astar.y))
+    
+    # calculate mediation effects
+    DE <- mean(PredictY_DEIEM - PredictY_TEDE_2)*100000
+    IEM <- mean(PredictY_IEDTE_1 - PredictY_IEMIED)*100000
+    IED <- mean(PredictY_IEMIED - PredictY_DEIEM)*100000
+    TE <- mean(PredictY_IEDTE_1 - PredictY_TEDE_2)*100000
+    # return effects for this sample
+    effects <- cbind(DE, IEM, IED, TE)
+    effects
+  }
+  
+  # Calculate the effects
+  # Direct effect
+  DE <- quantile(boot[,1], 0.5)
+  DE_low <- quantile(boot[,1], 0.025)
+  DE_up <- quantile(boot[,1], 0.975)
+  DE_result <- paste0(round(DE,2), ' (', round(DE_low, 2), ', ', round(DE_up, 2), ')')
+  
+  # Indirect effect through M
+  IEM <- quantile(boot[,2], 0.5)
+  IEM_low <- quantile(boot[,2], 0.025)
+  IEM_up <- quantile(boot[,2], 0.975)
+  IEM_result <- paste0(round(IEM,2), ' (', round(IEM_low, 2), ', ', round(IEM_up, 2), ')')
+  
+  # Indirect effect through D
+  IED <- quantile(boot[,3], 0.5)
+  IED_low <- quantile(boot[,3], 0.025)
+  IED_up <- quantile(boot[,3], 0.975)
+  IED_result <- paste0(round(IED,2), ' (', round(IED_low, 2), ', ', round(IED_up, 2), ')')
+  
+  # Total effect
+  TE <- quantile(boot[,4], 0.5)
+  TE_low <- quantile(boot[,4], 0.025)
+  TE_up <- quantile(boot[,4], 0.975)
+  TE_result <- paste0(round(TE,2), ' (', round(TE_low, 2), ', ', round(TE_up, 2), ')')
+  
+  # Relative indirect effect
+  Q <- round(IEM/TE*100,2)
+  
+  res <- list(DE=DE_result, IEM=IEM_result, IED=IED_result, TE=TE_result, Q=Q)
+  return(res)
+}
+```
