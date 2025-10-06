@@ -1,0 +1,52 @@
+---
+title: "Progress_Report"
+author: "Xiaoni Xu"
+date: "2025-10-06"
+output: html_document
+---
+
+
+## Setup and data preparation
+
+This step loads the dataset, samples 10000 rows (instead of 2000 rows from the beginning), and creates mediator names. The column names in the simulated data were changed to fit the med_longitudinal function.
+
+- Created mediator aliases `M_1`, `M_2` and a baseline `M` column so the outcome model can use `const(M)`.
+
+- Created models for the bootstrap sample:
+
+Mediator models: `M_1 ~ E + C`, `M_2 ~ E + M_1 + C` (linear).
+
+Dropout models: `D1 ~ E + M_1 + C`, `D2 ~ E + M_2 + C` (logistic).
+
+Outcome model: Additive Aalen survival model with `Surv(tstart,tstop,endpt) ~ const(E) + const(M) + const(C)`.
+
+- Standardized IDs (`id_unique`, `idno`) for `tmerge` and later subsetting.
+
+- Properly constructed reshape(..., varying=list(M_cols, TS_cols)) with one list entry per time-varying variable
+
+## Models fitted per bootstrap resample
+
+I refitteds mediator, dropout, and outcome models on a bootstrap resample, which is based on the existing codes.
+
+## `med_longitudinal` function
+
+The function is solely based on the existing one.
+
+## Results obtained from running med_longitudinal
+
+After debugging the pipeline and ensuring all variable names matched correctly, the function ran successfully on the resampled dataset.  
+
+The estimated mediation effects (per 100,000 person-years) from one full run are shown below.
+
+  DE  = 146.8186,
+  
+  IEM = -19.19714,
+  
+  IED = -0.5660544,
+  
+  TE  = 127.0554
+
+
+The negative IED and IEM value suggests a negative mediation pathway in this simulated setting, while the direct effect (DE) remains the primary positive contribution to the total effect (TE). 
+
+The negative values are not expected from the dataet, which might be a result of subsampling. A new dataset is put into place to try to fix the issue.

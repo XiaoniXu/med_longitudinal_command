@@ -16,6 +16,8 @@ library(data.table)
 library(survival)
 library(mvtnorm)
 library(parallel)
+
+knitr::opts_chunk$set(eval = FALSE, warning = FALSE, message = FALSE)
 ```
 
 ## Setup and data preparation
@@ -36,7 +38,7 @@ Outcome model: Additive Aalen survival model with `Surv(tstart,tstop,endpt) ~ co
 
 - Properly constructed reshape(..., varying=list(M_cols, TS_cols)) with one list entry per time-varying variable
 
-```{r}
+```{r eval=FALSE}
 # Load data
 load("simData.mimick.SHS.RDa")
 
@@ -68,7 +70,7 @@ str(simData[, c("E","C","M_1","M_2","tstart","tstop","id_unique")])
 ## Models fitted per bootstrap resample
 
 I refitteds mediator, dropout, and outcome models on a bootstrap resample, which is based on the existing codes.
-```{r}
+```{r eval=FALSE}
 # One illustrative iteration (set eval=TRUE to run)
 ind  <- sample(seq_len(nrow(simData)), replace = TRUE)
 data <- simData[ind, , drop = FALSE]
@@ -139,7 +141,7 @@ a_star <- as.numeric(quantile(data$E, 0.75, na.rm = TRUE))
 ## `med_longitudinal` function
 
 The function is solely based on the existing one.
-```{r}
+```{r eval=FALSE}
 med_longitudinal=function(L=NULL, M, m, Y, treat='logcocr',
                           control.value=a, treat.value=a_star,
                           data, time_points, peryr=100000){
@@ -148,7 +150,7 @@ med_longitudinal=function(L=NULL, M, m, Y, treat='logcocr',
   NL <- length(L)
   NM <- length(M)
 
-  boot <- foreach(i=1:10000, .combine='rbind') %dopar% {
+  boot <- foreach(i=1:10000, .combine='rbind') %dopar%{ 
     ind <- sample(1:N, replace=TRUE)
 
     # Parameter draws for mediators
