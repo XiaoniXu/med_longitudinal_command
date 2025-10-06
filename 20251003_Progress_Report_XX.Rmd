@@ -5,6 +5,11 @@ date: "2025-10-06"
 output: html_document
 ---
 ```{r}
+# rmarkdown::render("20251003_Progress_Report_XX.Rmd", clean = TRUE, envir = new.env(parent = emptyenv()))
+```
+
+
+```{r eval = FALSE}
 library(SimDesign)
 library(timereg)
 library(tidyr)
@@ -332,15 +337,13 @@ After debugging the pipeline and ensuring all variable names matched correctly, 
 The estimated mediation effects (per 100,000 person-years) from one full run are shown below.
 
 
-```{r}
-effects <- data.frame(
   DE  = 146.8186,
+  
   IEM = -19.19714,
+  
   IED = -0.5660544,
+  
   TE  = 127.0554
-)
-knitr::kable(effects, caption = "Estimated mediation effects from the successful run")
-```
 
 The negative IED and IEM value suggests a negative mediation pathway in this simulated setting, while the direct effect (DE) remains the primary positive contribution to the total effect (TE). 
 

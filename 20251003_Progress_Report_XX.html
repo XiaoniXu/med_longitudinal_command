@@ -13,7 +13,7 @@
 
 <meta name="date" content="2025-10-06" />
 
-<title>Progress_Report</title>
+<title>20251003_Progress_Report_XX</title>
 
 <script>// Pandoc 2.9 adds attributes on both header and div. We remove the former (to
 // be compatible with the behavior of Pandoc < 2.8).
@@ -350,13 +350,27 @@ display: none;
 
 
 
-<h1 class="title toc-ignore">Progress_Report</h1>
+<h1 class="title toc-ignore">20251003_Progress_Report_XX</h1>
 <h4 class="author">Xiaoni Xu</h4>
 <h4 class="date">2025-10-06</h4>
 
 </div>
 
 
+<pre class="r"><code># rmarkdown::render(&quot;20251003_Progress_Report_XX.Rmd&quot;, clean = TRUE, envir = new.env(parent = emptyenv()))</code></pre>
+<pre class="r"><code>library(SimDesign)
+library(timereg)
+library(tidyr)
+library(dplyr)
+library(mice)
+library(splitstackshape)
+library(foreach)
+library(data.table)
+library(survival)
+library(mvtnorm)
+library(parallel)
+
+knitr::opts_chunk$set(eval = FALSE, warning = FALSE, message = FALSE)</code></pre>
 <div id="setup-and-data-preparation" class="section level2">
 <h2>Setup and data preparation</h2>
 <p>This step loads the dataset, samples 10000 rows (instead of 2000 rows
@@ -380,15 +394,285 @@ baseline <code>M</code> column so the outcome model can use
 <li><p>Properly constructed reshape(…, varying=list(M_cols, TS_cols))
 with one list entry per time-varying variable</p></li>
 </ul>
+<pre class="r"><code># Load data
+load(&quot;simData.mimick.SHS.RDa&quot;)
+
+set.seed(2)
+
+# Sample to 10,000 rows
+simData &lt;- simData[sample(1:nrow(simData), size = 10000, replace = FALSE), ]
+
+# Create mediator aliases
+simData[, M_1 := M1]
+simData[, M_2 := M2]
+
+# Counting-process helpers and unique ID for tmerge
+simData[, `:=`(
+  tstart = 0,
+  tstop  = time_to_event,
+  time.since.first.exam_1 = 0,
+  time.since.first.exam_2 = time_to_event,
+  id_unique = .I
+)]
+
+# Make sure it&#39;s a data.frame where needed downstream
+simData &lt;- as.data.frame(simData)
+
+# Quick peek
+str(simData[, c(&quot;E&quot;,&quot;C&quot;,&quot;M_1&quot;,&quot;M_2&quot;,&quot;tstart&quot;,&quot;tstop&quot;,&quot;id_unique&quot;)])</code></pre>
 </div>
 <div id="models-fitted-per-bootstrap-resample" class="section level2">
 <h2>Models fitted per bootstrap resample</h2>
 <p>I refitteds mediator, dropout, and outcome models on a bootstrap
 resample, which is based on the existing codes.</p>
+<pre class="r"><code># One illustrative iteration (set eval=TRUE to run)
+ind  &lt;- sample(seq_len(nrow(simData)), replace = TRUE)
+data &lt;- simData[ind, , drop = FALSE]
+
+# IDs for tmerge and selection
+data$id_unique &lt;- seq_len(nrow(data))
+data$idno      &lt;- if (&quot;id&quot; %in% names(data)) data$id else data$id_unique
+
+# Ensure baseline M exists for const(M) in the Aalen model
+if (!(&quot;M&quot; %in% names(data))) data$M &lt;- data$M_1
+
+# Mediator and dropout models
+M1 &lt;- lm(M_1 ~ E + C, data = data)
+L1 &lt;- glm(D1 ~ E + M_1 + C, data = data, family = binomial())
+M2 &lt;- lm(M_2 ~ E + M_1 + C, data = data)
+L2 &lt;- glm(D2 ~ E + M_2 + C, data = data, family = binomial())
+
+# Counting-process outcome data with time-varying mediator injected via tdc()
+df &lt;- survival::tmerge(
+  data1 = data,
+  data2 = data,
+  id    = id_unique,
+  endpt = event(time_to_event, eventHappened)
+)
+
+# Long form mediator with measurement times
+df_tv &lt;- reshape(
+  as.data.frame(data),
+  direction = &quot;long&quot;,
+  varying   = list(
+    M    = c(&quot;M_1&quot;, &quot;M_2&quot;),
+    time = c(&quot;time.since.first.exam_1&quot;, &quot;time.since.first.exam_2&quot;)
+  ),
+  v.names = c(&quot;M&quot;, &quot;time.since.first.exam&quot;),
+  times   = c(1, 2),
+  idvar   = &quot;id_unique&quot;
+)
+df_tv &lt;- df_tv[order(df_tv$id_unique, df_tv$time), ]
+
+# Inject time-dependent covariate
+df &lt;- survival::tmerge(
+  data1 = df,
+  data2 = df_tv,
+  id    = id_unique,
+  M     = tdc(time.since.first.exam, M)
+)
+
+# Outcome model: additive hazards
+Y &lt;- timereg::aalen(
+  Surv(tstart, tstop, endpt) ~ const(E) + const(M) + const(C),
+  data = df,
+  resample.iid = 1,
+  n.sim = 0
+)
+
+# Inputs that the mediation function expects
+treat &lt;- &quot;E&quot;
+L     &lt;- list(L1 = L1, L2 = L2)
+Mlist &lt;- list(M1 = M1, M2 = M2)
+mvec  &lt;- c(&quot;M_1&quot;, &quot;M_2&quot;)
+tpts  &lt;- c(&quot;1&quot;, &quot;2&quot;)
+
+a      &lt;- as.numeric(quantile(data$E, 0.25, na.rm = TRUE))
+a_star &lt;- as.numeric(quantile(data$E, 0.75, na.rm = TRUE))</code></pre>
 </div>
 <div id="med_longitudinal-function" class="section level2">
 <h2><code>med_longitudinal</code> function</h2>
 <p>The function is solely based on the existing one.</p>
+<pre class="r"><code>med_longitudinal=function(L=NULL, M, m, Y, treat=&#39;logcocr&#39;,
+                          control.value=a, treat.value=a_star,
+                          data, time_points, peryr=100000){
+
+  N  &lt;- dim(data)[1]
+  NL &lt;- length(L)
+  NM &lt;- length(M)
+
+  boot &lt;- foreach(i=1:10000, .combine=&#39;rbind&#39;) %dopar%{ 
+    ind &lt;- sample(1:N, replace=TRUE)
+
+    # Parameter draws for mediators
+    MModel &lt;- vector(&quot;list&quot;, NM)
+    for (i in 1:NM){
+      MModel[[i]] &lt;- mvtnorm::rmvnorm(1, mean = coef(M[[i]]), sigma = vcov(M[[i]]))
+    }
+
+    # Parameter draw for outcome (Aalen)
+    YModel &lt;- mvtnorm::rmvnorm(1, mean = Y$gamma, sigma = Y$robvar.gamma)
+
+    PredictL_a &lt;- PredictL_astar &lt;- PredictL_astar_a &lt;- matrix(NA,nrow=N,ncol=NL)
+    PredictM_a &lt;- PredictM_astar &lt;- PredictM_a_astar &lt;- matrix(NA,nrow=N,ncol=NM)
+
+    # Predict M1 under a and a*
+    pred.data.astar.m1 &lt;- pred.data.a.m1 &lt;- model.frame(M[[1]])[ind,]
+    pred.data.astar.m1[, treat] &lt;- treat.value
+    pred.data.a.m1[, treat]     &lt;- control.value
+
+    m1mat.astar &lt;- model.matrix(terms(M[[1]]), data = pred.data.astar.m1)
+    m1mat.a     &lt;- model.matrix(terms(M[[1]]), data = pred.data.a.m1)
+
+    PredictM_astar[,1] &lt;- tcrossprod(MModel[[1]], m1mat.astar)
+    PredictM_a[,1]     &lt;- tcrossprod(MModel[[1]], m1mat.a)
+
+    # Predict L1 if present
+    if(NL &gt; 0){
+      pred.data.astar.l1 &lt;- pred.data.a.l1 &lt;- pred.data.astar.a.l1 &lt;- model.frame(L[[1]])[ind,]
+      pred.data.astar.l1[, treat]        &lt;- treat.value
+      pred.data.astar.a.l1[, treat]      &lt;- treat.value
+      pred.data.a.l1[, treat]            &lt;- control.value
+      pred.data.astar.l1[, m[1]]         &lt;- PredictM_astar[,1]
+      pred.data.a.l1[, m[1]]             &lt;- PredictM_a[,1]
+      pred.data.astar.a.l1[, m[1]]       &lt;- PredictM_a[,1]
+
+      PredictL_astar_a[,1] &lt;- rbinom(N, 1, predict(L[[1]], pred.data.astar.a.l1, type=&#39;response&#39;))
+      PredictL_a[,1]       &lt;- rbinom(N, 1, predict(L[[1]], pred.data.a.l1,       type=&#39;response&#39;))
+      PredictL_astar[,1]   &lt;- rbinom(N, 1, predict(L[[1]], pred.data.astar.l1,   type=&#39;response&#39;))
+    }
+
+    # Later mediators and dropout
+    if (NM &gt; 1){
+      for (i in 2:NM){
+        pred.data.a.m       &lt;- pred.data.astar.m       &lt;- pred.data.a.astar.m       &lt;-
+          as.data.frame(matrix(nrow=N, ncol=(dim(model.frame(M[[i]]))[2]-1)))
+        colnames(pred.data.a.m) &lt;- colnames(pred.data.astar.m) &lt;- colnames(pred.data.a.astar.m) &lt;-
+          attr(terms(M[[i]]),&quot;term.labels&quot;)
+        names &lt;- colnames(pred.data.a.m)[which(colnames(pred.data.a.m) %in% attr(terms(M[[1]]),&quot;term.labels&quot;))]
+
+        pred.data.a.m[, names]       &lt;- model.frame(M[[1]])[ind,names]
+        pred.data.astar.m[, names]   &lt;- model.frame(M[[1]])[ind,names]
+        pred.data.a.astar.m[, names] &lt;- model.frame(M[[1]])[ind,names]
+
+        pred.data.a.m[, treat]       &lt;- control.value
+        pred.data.a.astar.m[, treat] &lt;- control.value
+        pred.data.astar.m[, treat]   &lt;- treat.value
+
+        pred.data.a.m[, m[i-1]]       &lt;- PredictM_a[,i-1]
+        pred.data.astar.m[, m[i-1]]   &lt;- PredictM_astar[,i-1]
+        pred.data.a.astar.m[, m[i-1]] &lt;- PredictM_a_astar[,i-1]
+        if(i==2) pred.data.a.astar.m[, m[1]] &lt;- PredictM_a[,1]
+
+        if(NL &gt; 1){
+          m1mat.a.m         &lt;- model.matrix(~., data = pred.data.a.m      [which(PredictL_a[,i-1]==0),])
+          m1mat.astar.m     &lt;- model.matrix(~., data = pred.data.astar.m  [which(PredictL_astar[,i-1]==0),])
+          m1mat.a.astar.m   &lt;- model.matrix(~., data = pred.data.a.astar.m[which(PredictL_astar_a[,i-1]==0),])
+
+          PredictM_a       [which(PredictL_a[,i-1]==0),i]         &lt;- tcrossprod(MModel[[i]], m1mat.a.m)
+          PredictM_astar   [which(PredictL_astar[,i-1]==0),i]     &lt;- tcrossprod(MModel[[i]], m1mat.astar.m)
+          PredictM_a_astar [which(PredictL_astar_a[,i-1]==0),i]   &lt;- tcrossprod(MModel[[i]], m1mat.a.astar.m)
+        } else {
+          PredictM_a[,i]       &lt;- tcrossprod(MModel[[i]], model.matrix(~., data = pred.data.a.m))
+          PredictM_astar[,i]   &lt;- tcrossprod(MModel[[i]], model.matrix(~., data = pred.data.astar.m))
+          PredictM_a_astar[,i] &lt;- tcrossprod(MModel[[i]], model.matrix(~., data = pred.data.a.astar.m))
+        }
+
+        if(NL &gt; 1 &amp; i&lt;=NL){
+          pred.data.a.l &lt;- pred.data.astar.l &lt;- pred.data.astar.a.l &lt;-
+            as.data.frame(matrix(nrow=N, ncol=(dim(model.frame(L[[i]]))[2]-1)))
+          colnames(pred.data.a.l) &lt;- colnames(pred.data.astar.l) &lt;- colnames(pred.data.astar.a.l) &lt;-
+            attr(terms(L[[i]]),&quot;term.labels&quot;)
+          names &lt;- colnames(pred.data.a.l)[which(colnames(pred.data.a.l) %in% attr(terms(L[[1]]),&quot;term.labels&quot;))]
+
+          pred.data.a.l[, names]       &lt;- model.frame(L[[1]])[ind,names]
+          pred.data.astar.l[, names]   &lt;- model.frame(L[[1]])[ind,names]
+          pred.data.astar.a.l[, names] &lt;- model.frame(L[[1]])[ind,names]
+
+          pred.data.a.l[, treat]       &lt;- control.value
+          pred.data.astar.l[, treat]   &lt;- treat.value
+          pred.data.astar.a.l[, treat] &lt;- treat.value
+
+          pred.data.a.l[, m[i]]       &lt;- PredictM_a[,i]
+          pred.data.astar.l[, m[i]]   &lt;- PredictM_astar[,i]
+          pred.data.astar.a.l[, m[i]] &lt;- PredictM_a_astar[,i]
+
+          PredictL_a       [which(PredictL_a[,i-1]==0),i]         &lt;- rbinom(length(which(PredictL_a[,i-1]==0)), 1, predict(L[[i]], pred.data.a.l      [which(PredictL_a[,i-1]==0),], type=&#39;response&#39;))
+          PredictL_astar   [which(PredictL_astar[,i-1]==0),i]     &lt;- rbinom(length(which(PredictL_astar[,i-1]==0)), 1, predict(L[[i]], pred.data.astar.l  [which(PredictL_astar[,i-1]==0),], type=&#39;response&#39;))
+          PredictL_astar_a [which(PredictL_astar_a[,i-1]==0),i]   &lt;- rbinom(length(which(PredictL_astar_a[,i-1]==0)), 1, predict(L[[i]], pred.data.astar.a.l[which(PredictL_astar_a[,i-1]==0),], type=&#39;response&#39;))
+        }
+      }
+    }
+
+    # Build counterfactual design matrices for Y
+    pred.data.a.y &lt;- pred.data.astar.y &lt;- pred.data.astar.a.y &lt;- pred.data.astar.a.astar.a.y &lt;-
+      data[ind, c(&#39;idno&#39;, getvarnames(Y$call)$xvar[-2], m, colnames(data)[grep(&#39;time.since.first.exam&#39;, colnames(data))])]
+
+    pred.data.a.y[, treat] &lt;- control.value
+    pred.data.astar.y[, treat] &lt;- pred.data.astar.a.y[, treat] &lt;- pred.data.astar.a.astar.a.y[, treat] &lt;- treat.value
+    pred.data.a.y[, m] &lt;- pred.data.astar.a.y[, m] &lt;- PredictM_a
+    pred.data.astar.y[, m] &lt;- PredictM_astar
+    pred.data.astar.a.astar.a.y[, m] &lt;- PredictM_a_astar
+    pred.data.astar.a.astar.a.y[, m[1]] &lt;- PredictM_a[,1]
+
+    M_cols  &lt;- m
+    TS_cols &lt;- paste0(&quot;time.since.first.exam_&quot;, time_points)
+    stopifnot(length(M_cols) == length(TS_cols))
+
+    reshape_to_long &lt;- function(df_wide){
+      df_wide$id_boot &lt;- seq_len(nrow(df_wide))
+      df_long &lt;- reshape(
+        df_wide,
+        direction = &quot;long&quot;,
+        varying   = list(M_cols, TS_cols),
+        v.names   = c(&quot;M&quot;,&quot;time_since&quot;),
+        times     = time_points,
+        timevar   = &quot;tidx&quot;,
+        idvar     = &quot;id_boot&quot;
+      )
+      df_long[order(df_long$id_boot, df_long$tidx), , drop = FALSE]
+    }
+
+    # Align to the Aalen xvar ordering
+    build_X &lt;- function(dfw){
+      dfl &lt;- reshape_to_long(dfw)
+      X   &lt;- dfl[, match(getvarnames(Y$call)$xvar, colnames(dfl)), drop = FALSE]
+      model.matrix(~., data = X)[, -1, drop = FALSE]
+    }
+
+    X_DEIEM   &lt;- build_X(pred.data.astar.a.y)
+    X_TEDE_2  &lt;- build_X(pred.data.a.y)
+    X_IEMIED  &lt;- build_X(pred.data.astar.a.astar.a.y)
+    X_IEDTE_1 &lt;- build_X(pred.data.astar.y)
+
+    PredictY_DEIEM   &lt;- mean(tcrossprod(YModel, X_DEIEM))
+    PredictY_TEDE_2  &lt;- mean(tcrossprod(YModel, X_TEDE_2))
+    PredictY_IEMIED  &lt;- mean(tcrossprod(YModel, X_IEMIED))
+    PredictY_IEDTE_1 &lt;- mean(tcrossprod(YModel, X_IEDTE_1))
+
+    DE  &lt;- mean(PredictY_DEIEM -  PredictY_TEDE_2)  * peryr
+    IEM &lt;- mean(PredictY_IEDTE_1 - PredictY_IEMIED) * peryr
+    IED &lt;- mean(PredictY_IEMIED -  PredictY_DEIEM)  * peryr
+    TE  &lt;- mean(PredictY_IEDTE_1 - PredictY_TEDE_2) * peryr
+
+    cbind(DE, IEM, IED, TE)
+  }
+
+  # Summaries of the inner bootstrap
+  DE &lt;- quantile(boot[,1], 0.5); DE_low &lt;- quantile(boot[,1], 0.025); DE_up &lt;- quantile(boot[,1], 0.975)
+  IEM &lt;- quantile(boot[,2], 0.5); IEM_low &lt;- quantile(boot[,2], 0.025); IEM_up &lt;- quantile(boot[,2], 0.975)
+  IED &lt;- quantile(boot[,3], 0.5); IED_low &lt;- quantile(boot[,3], 0.025); IED_up &lt;- quantile(boot[,3], 0.975)
+  TE  &lt;- quantile(boot[,4], 0.5); TE_low  &lt;- quantile(boot[,4], 0.025); TE_up  &lt;- quantile(boot[,4], 0.975)
+
+  DE_result  &lt;- paste0(round(DE,2),  &quot; (&quot;, round(DE_low, 2), &quot;, &quot;, round(DE_up,  2), &quot;)&quot;)
+  IEM_result &lt;- paste0(round(IEM,2), &quot; (&quot;, round(IEM_low,2), &quot;, &quot;, round(IEM_up, 2), &quot;)&quot;)
+  IED_result &lt;- paste0(round(IED,2), &quot; (&quot;, round(IED_low,2), &quot;, &quot;, round(IED_up, 2), &quot;)&quot;)
+  TE_result  &lt;- paste0(round(TE,2),  &quot; (&quot;, round(TE_low, 2), &quot;, &quot;, round(TE_up,  2), &quot;)&quot;)
+
+  Q &lt;- round(IEM/TE*100, 2)
+
+  list(DE=DE_result, IEM=IEM_result, IED=IED_result, TE=TE_result, Q=Q)
+}</code></pre>
 </div>
 <div id="results-obtained-from-running-med_longitudinal" class="section level2">
 <h2>Results obtained from running med_longitudinal</h2>
