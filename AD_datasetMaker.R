@@ -144,8 +144,8 @@ f <- function(x) {
 uniroot(f, c(-10, -4))$root
 
 summary(simData$nci)
-Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
-0.00000 0.00000 0.00000 0.09848 0.00000 1.00000 
+#Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.00000 0.00000 0.00000 0.09848 0.00000 1.00000 
 
 f <- function(x) {
   exp(-exp(-7.45413779 + Y_1_E * E + Y_1_C * C + Y_1_M_1 * M1) * t_2) + 
