@@ -23,7 +23,7 @@ library(doParallel)
 
 
 ```{r}
-load("simData.mimick.SHS.RDa")
+load("simData.Y10D10.Population.RData")
 
 
 set.seed(2)  
@@ -130,6 +130,24 @@ for (i in 1:1000) {
   boot[i, ] <- as.numeric(out)
 }
 ```
+Result 2025/10/09:
+
+$DE
+[1] "116.04 (50.61, 184.85)"
+
+$IEM
+[1] "31.52 (-26.96, 88.81)"
+
+$IED
+[1] "-0.36 (-0.67, 0)"
+
+$TE
+[1] "147.6 (100.05, 194.07)"
+
+$Q
+  50% 
+21.35 
+
 
 see the results
 ```{r}
@@ -152,6 +170,29 @@ qfun <- function(x) {
 summ <- t(apply(boot, 2, qfun))
 round(summ, 3)
 
+```
+```{r}
+getvarnames <- function(formula, data = NULL)
+{
+  if (is.character(formula))
+    return(list(varnames=formula, xvar=formula, yvar=NULL))
+  if (is.null(formula)) return(list(varnames=NULL, xvar=NULL, yvar=NULL))
+  formula <- formula(formula)
+  lyv <- NULL
+  lxv <- lvnm <- all.vars(formula[1:2])
+  if (length(formula)==3) {
+    lyv <- lxv
+    lxv <- all.vars(formula[-2])
+    if ("." %in% lxv) {
+      if (length(data)==0)
+        stop("!getvarnames! '.' in formula and no 'data'")
+      lform <- formula(terms(formula, data=data))
+      lxv <- all.vars(lform[-2])
+    }
+    lvnm <- c(lxv, lvnm)
+  }
+  list(varnames=lvnm, xvar=lxv, yvar=lyv)
+}
 ```
 
 
